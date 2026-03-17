@@ -1,114 +1,45 @@
 # predict_v2.py
-# 适配：train.py(全局标准化) / train_v2.py(横截面y_cs + 全局标准化)
+# 适配：train_v1.py(全局标准化) / train_v2.py(横截面y_cs + 全局标准化)
 # 用法：python predict_v2.py
-import os
+
 import glob
-import math
-import pandas as pd
+import os
+from datetime import date
+
 import numpy as np
+import pandas as pd
 import torch
-import torch.nn as nn
+
+from config import get_root_logger
+from features import FEAT_COLS, make_features
+from model import ReturnPredictor
 
 # =========================
 # Config
 # =========================
 LOOKBACK = 60
-TOPK = 10
+TOPK     = 10
+
+# 数据新鲜度警告阈值（交易日，约 3 个自然日对应 2-3 个交易日）
+STALE_DAYS_THRESHOLD = 5
 
 BASE_DIR = os.path.dirname(__file__)
-RAW_DIR = os.path.join(BASE_DIR, "data_akshare", "raw")   # ✅ 你的数据目录
-OUT_DIR = os.path.join(BASE_DIR, "outputs")
+RAW_DIR  = os.path.join(BASE_DIR, "data_akshare", "raw")
+OUT_DIR  = os.path.join(BASE_DIR, "outputs")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # 你训练产物（v1 / v2 任选其一）
-# - v1: checkpoints/best.pt
-# - v2: checkpoints_v2/best.pt
 CKPT_CANDIDATES = [
     os.path.join(BASE_DIR, "checkpoints_v2", "best.pt"),
-    os.path.join(BASE_DIR, "checkpoints", "best.pt"),
+    os.path.join(BASE_DIR, "checkpoints",    "best.pt"),
 ]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # =========================
-# Model (必须与训练一致)
+# 工具函数
 # =========================
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
-
-
-class ReturnPredictor(nn.Module):
-    def __init__(self, num_features, d_model=64, nhead=4, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.proj = nn.Linear(num_features, d_model)
-        self.pos = PositionalEncoding(d_model)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=256,
-            dropout=dropout, batch_first=True, activation="gelu"
-        )
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, 64),
-            nn.GELU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        h = self.proj(x)
-        h = self.pos(h)
-        h = self.enc(h)
-        return self.head(h[:, -1, :])
-
-
-# =========================
-# Feature engineering (与训练一致：不做单股zscore)
-# =========================
-FEAT_COLS = ["r1","r5","r10","d_ma20","d_ma60","d_vol20","hl_range","vol10","vol20","vol60"]
-
-def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["r1"]  = df["close"].pct_change(1)
-    df["r5"]  = df["close"].pct_change(5)
-    df["r10"] = df["close"].pct_change(10)
-
-    def ma(x, w): return x.rolling(w).mean()
-    def std(x, w): return x.rolling(w).std()
-
-    df["ma20"] = ma(df["close"], 20)
-    df["ma60"] = ma(df["close"], 60)
-    df["d_ma20"] = df["close"] / df["ma20"] - 1.0
-    df["d_ma60"] = df["close"] / df["ma60"] - 1.0
-
-    df["vol_ma20"] = ma(df["volume"], 20)
-    df["d_vol20"] = df["volume"] / df["vol_ma20"] - 1.0
-
-    df["hl_range"] = (df["high"] - df["low"]) / df["close"]
-    df["vol10"] = std(df["r1"], 10)
-    df["vol20"] = std(df["r1"], 20)
-    df["vol60"] = std(df["r1"], 60)
-
-    df = df.dropna(subset=FEAT_COLS).reset_index(drop=True)
-    return df[["date"] + FEAT_COLS]
-
-
 def load_ckpt() -> tuple[str, dict]:
     for p in CKPT_CANDIDATES:
         if os.path.exists(p):
@@ -119,19 +50,18 @@ def load_ckpt() -> tuple[str, dict]:
 
 def get_global_stats(state: dict) -> tuple[pd.Series, pd.Series]:
     if "global_mu" not in state or "global_sd" not in state:
-        raise RuntimeError("Checkpoint missing global_mu/global_sd. Use the train.py / train_v2.py that saves them.")
-    mu = pd.Series(state["global_mu"])
-    sd = pd.Series(state["global_sd"])
-    # 对齐列顺序
-    mu = mu.reindex(FEAT_COLS)
-    sd = sd.reindex(FEAT_COLS).replace(0, 1e-8).fillna(1e-8)
+        raise RuntimeError(
+            "Checkpoint missing global_mu/global_sd. Use train_v1.py / train_v2.py that saves them."
+        )
+    mu = pd.Series(state["global_mu"]).reindex(FEAT_COLS)
+    sd = pd.Series(state["global_sd"]).reindex(FEAT_COLS).replace(0, 1e-8).fillna(1e-8)
     if mu.isna().any():
         raise RuntimeError(f"global_mu missing some columns: {mu[mu.isna()].index.tolist()}")
     return mu, sd
 
 
 @torch.no_grad()
-def predict_one(model: nn.Module, df_feat: pd.DataFrame, mu: pd.Series, sd: pd.Series) -> float | None:
+def predict_one(model, df_feat: pd.DataFrame, mu: pd.Series, sd: pd.Series):
     if len(df_feat) < LOOKBACK:
         return None
 
@@ -140,13 +70,26 @@ def predict_one(model: nn.Module, df_feat: pd.DataFrame, mu: pd.Series, sd: pd.S
     x = x.values.astype(np.float32)[-LOOKBACK:]  # [L, F]
 
     xt = torch.tensor(x).unsqueeze(0).to(DEVICE)  # [1, L, F]
-    y = model(xt).item()
-    return float(y)
+    return float(model(xt).item())
+
+
+def check_data_freshness(last_date: date, logger) -> None:
+    """校验数据新鲜度，若数据超过阈值天数则发出警告"""
+    today = pd.Timestamp.now().date()
+    delta = (today - last_date).days
+    if delta > STALE_DAYS_THRESHOLD:
+        logger.warning(
+            "数据新鲜度警告：最新数据日期为 %s，距今已 %d 天（>%d），"
+            "建议先运行 update_recent_data.py 更新数据后再预测。",
+            last_date, delta, STALE_DAYS_THRESHOLD,
+        )
 
 
 def main():
+    logger = get_root_logger()
+
     ckpt_path, state = load_ckpt()
-    print("using ckpt:", ckpt_path)
+    logger.info("使用 checkpoint: %s", ckpt_path)
 
     mu, sd = get_global_stats(state)
 
@@ -156,11 +99,7 @@ def main():
     if not files:
         raise RuntimeError(f"No parquet/csv files in {RAW_DIR}")
 
-    # 推断 num_features
-    tmp = pd.read_parquet(files[0]) if files[0].endswith(".parquet") else pd.read_csv(files[0])
-    tmp_feat = make_features(tmp)
     num_features = len(FEAT_COLS)
-
     model = ReturnPredictor(num_features).to(DEVICE)
     model.load_state_dict(state["model"])
     model.eval()
@@ -172,25 +111,40 @@ def main():
             df = pd.read_parquet(fp) if fp.endswith(".parquet") else pd.read_csv(fp)
             if "date" not in df.columns:
                 continue
-            df_feat = make_features(df)
+            df_feat = make_features(df)   # 预测时不传 horizon，不计算标签
             pred = predict_one(model, df_feat, mu, sd)
             if pred is None:
                 continue
 
             last_date = pd.to_datetime(df_feat["date"].iloc[-1]).date()
+
+            # 数据新鲜度校验（只在第一只股票触发一次警告）
+            if not rows:
+                check_data_freshness(last_date, logger)
+
+            # 近期波动率（vol20）
+            vol20 = float(df_feat["vol20"].iloc[-1]) if "vol20" in df_feat.columns else np.nan
+
             rows.append({
-                "stock_code": code,
-                "asof_date": str(last_date),
-                # 注意：如果是 train_v2.py（y_cs），pred 是“相对收益信号”，适合排序，不等同绝对收益%
+                "stock_code":  code,
+                "asof_date":   str(last_date),
+                # 注意：如果是 train_v2.py（y_cs），pred 是"相对收益信号"，适合排序，不等同绝对收益%
                 "pred_signal": pred,
+                "vol20":       round(vol20, 6) if not np.isnan(vol20) else None,
             })
-        except Exception:
-            continue
+        except Exception as e:
+            logger.warning("股票 %s 预测失败：%s", code, repr(e))
 
     if not rows:
         raise RuntimeError("No predictions generated. Check raw data / feature columns.")
 
     out = pd.DataFrame(rows).sort_values("pred_signal", ascending=False).reset_index(drop=True)
+
+    # 信号排名百分位
+    n = len(out)
+    out["signal_rank"]       = range(1, n + 1)
+    out["signal_percentile"] = (1 - (out["signal_rank"] - 1) / max(n - 1, 1)).round(4)
+
     top = out.head(TOPK).copy()
 
     today = pd.Timestamp.now().strftime("%Y%m%d")
@@ -200,11 +154,11 @@ def main():
     out.to_csv(out_path_all, index=False, encoding="utf-8-sig")
     top.to_csv(out_path_top, index=False, encoding="utf-8-sig")
 
-    print("Saved:")
-    print("  ", out_path_all)
-    print("  ", out_path_top)
-    print("\nTopK:")
-    print(top[["stock_code", "asof_date", "pred_signal"]])
+    logger.info("已保存预测结果:")
+    logger.info("  全量 (%d 只): %s", len(out), out_path_all)
+    logger.info("  Top%d: %s", TOPK, out_path_top)
+    print("\nTopK 推荐:")
+    print(top[["stock_code", "asof_date", "pred_signal", "vol20", "signal_percentile"]])
 
 
 if __name__ == "__main__":
