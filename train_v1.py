@@ -31,10 +31,12 @@ class CFG:
     horizon: int = 5
     batch_size: int = 256
     lr: float = 3e-4
-    epochs: int = 10
+    epochs: int = 30
     num_workers: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     clip_grad: float = 1.0
+    early_stop_patience: int = 5
+    min_delta: float = 1e-5
 
     # 时间切分
     train_start: str = "2018-01-01"
@@ -344,8 +346,10 @@ def main():
     num_features = train_ds.X.shape[-1]
     model = ReturnPredictor(num_features).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
 
     best = 1e9
+    bad_epochs = 0
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
     for epoch in range(1, cfg.epochs + 1):
@@ -366,15 +370,24 @@ def main():
 
         train_mse = float(np.mean(losses)) if losses else 1e9
         val_mse = evaluate(model, valid_loader, cfg.device)
-        print(f"epoch={epoch} train_mse={train_mse:.6f} valid_mse={val_mse:.6f}")
+        lr_now = opt.param_groups[0]["lr"]
+        print(f"epoch={epoch} train_mse={train_mse:.6f} valid_mse={val_mse:.6f} lr={lr_now:.2e}")
 
-        if val_mse < best:
+        scheduler.step(val_mse)
+
+        if val_mse + cfg.min_delta < best:
             best = val_mse
+            bad_epochs = 0
             torch.save(
                 {"model": model.state_dict(), "cfg": cfg.__dict__, "global_mu": global_mu.to_dict(), "global_sd": global_sd.to_dict()},
                 cfg.best_ckpt
             )
             print(f"saved {cfg.best_ckpt}")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= cfg.early_stop_patience:
+                print("Early stopping!")
+                break
 
 
 if __name__ == "__main__":
