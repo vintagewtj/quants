@@ -1,0 +1,42 @@
+# 原始数据目录（体积大，不提交）
+data_akshare/
+
+# 模型 checkpoint 目录
+checkpoints/
+checkpoints_v2/
+checkpoints*/
+
+# 预测/回测输出
+outputs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虚拟环境
+.venv/
+venv/
+env/
+.env
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+logs/
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# 系统临时文件
+*.tmp
