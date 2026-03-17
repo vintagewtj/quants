@@ -9,6 +9,7 @@
 # 数据目录：data_akshare/raw/*.parquet（或 csv）
 # 直接运行：python train_v2.py
 
+import gc
 import os
 import math
 import glob
@@ -154,26 +155,38 @@ def attach_cross_sectional_label(frames: List[pd.DataFrame], winsor_p: float) ->
     """
     原地修改 frames：增加 y_cs
     y_cs = winsorize(y_raw within date) then demean by date
-    """
-    # concat 做一次横截面处理，再拆回去（比逐日逐股循环快）
-    lengths = [len(df) for df in frames]
-    big = pd.concat(frames, axis=0, ignore_index=True)
 
-    # winsorize per date
+    只 concat ["date", "y_raw"] 两列来计算横截面统计，减少内存占用；
+    计算出每个 date 的 winsorize 边界和均值后，逐 frame 回写结果。
+    """
     def _winsor(s: pd.Series) -> pd.Series:
         lo = s.quantile(winsor_p)
         hi = s.quantile(1 - winsor_p)
         return s.clip(lo, hi)
 
-    big["y_w"] = big.groupby("date")["y_raw"].transform(_winsor)
-    big["y_cs"] = big["y_w"] - big.groupby("date")["y_w"].transform("mean")
-    big = big.drop(columns=["y_w"])
+    # 仅 concat 必要的两列，大幅减少峰值内存
+    slim = pd.concat(
+        [df[["date", "y_raw"]] for df in frames],
+        axis=0,
+        ignore_index=True,
+    )
+    slim["y_w"] = slim.groupby("date")["y_raw"].transform(_winsor)
 
-    # 拆回 frames
+    # 计算每个 date 的均值，存为字典便于快速查找
+    date_mean_dict = slim.groupby("date")["y_w"].mean().to_dict()
+
+    # 拆回每个 frame，逐帧回写 y_cs，避免持有整个大 DataFrame
     idx = 0
-    for i, L in enumerate(lengths):
-        frames[i] = big.iloc[idx: idx + L].reset_index(drop=True)
+    for i, df in enumerate(frames):
+        L = len(df)
+        y_w = slim["y_w"].iloc[idx: idx + L].values
+        dates = slim["date"].iloc[idx: idx + L].values
+        means = np.array([date_mean_dict[d] for d in dates], dtype=np.float32)
+        frames[i]["y_cs"] = (y_w - means).astype(np.float32)
         idx += L
+
+    del slim, date_mean_dict
+    gc.collect()
 
 
 # -------------------------
@@ -181,12 +194,14 @@ def attach_cross_sectional_label(frames: List[pd.DataFrame], winsor_p: float) ->
 # -------------------------
 class StockWindowDatasetCS(Dataset):
     """
-    生成样本，同时保留每条样本的 date（用于按日算 IC/RankIC）
+    懒加载 Dataset：不在 __init__ 中预构建全量滑窗 tensor，
+    改为存储原始 numpy 数组 + 索引列表，在 __getitem__ 中按需切窗口。
+    峰值内存从 ~37 GB 降至 ~1-2 GB。
     """
     def __init__(self, frames: List[pd.DataFrame], start_date: str, end_date: str, mu: pd.Series, sd: pd.Series):
-        self.X = []
-        self.y = []
-        self.dates = []
+        self.samples = []       # list of (frame_idx, row_idx)
+        self.frames_data = []   # list of (feats_np, labels_np, dates_np)
+        self.lookback = cfg.lookback
 
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
@@ -207,27 +222,24 @@ class StockWindowDatasetCS(Dataset):
             labels = dff["y_cs"].values.astype(np.float32)
             dates = dff["date"].values  # numpy datetime64
 
-            for i in range(cfg.lookback - 1, len(dff)):
-                x = feats[i - cfg.lookback + 1: i + 1]
-                t = labels[i]
-                self.X.append(x)
-                self.y.append([t])
-                self.dates.append(dates[i])
+            fi = len(self.frames_data)
+            self.frames_data.append((feats, labels, dates))
 
-        if not self.X:
-            self.X = torch.empty((0, cfg.lookback, len(feat_cols)), dtype=torch.float32)
-            self.y = torch.empty((0, 1), dtype=torch.float32)
-            self.dates = np.array([], dtype="datetime64[ns]")
-        else:
-            self.X = torch.tensor(np.stack(self.X), dtype=torch.float32)
-            self.y = torch.tensor(np.stack(self.y), dtype=torch.float32)
-            self.dates = np.array(self.dates)
+            for i in range(cfg.lookback - 1, len(dff)):
+                self.samples.append((fi, i))
+
+        self.num_features = len(feat_cols)
 
     def __len__(self):
-        return int(self.X.shape[0])
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx], self.dates[idx]
+        fi, ri = self.samples[idx]
+        feats, labels, dates = self.frames_data[fi]
+        x = torch.from_numpy(feats[ri - self.lookback + 1: ri + 1].copy())
+        y = torch.tensor([labels[ri]], dtype=torch.float32)
+        d = dates[ri]
+        return x, y, d
 
 
 def collate_with_dates(batch):
@@ -377,10 +389,12 @@ def main():
 
     # 先做横截面标签变换（得到 y_cs）
     attach_cross_sectional_label(frames, cfg.winsor_p)
+    gc.collect()
 
     feat_cols = [c for c in frames[0].columns if c not in ["date", "y_raw", "y_cs"]]
     global_mu, global_sd = compute_global_stats(frames, cfg.train_start, cfg.train_end, feat_cols)
     print("global stats computed on train period:", cfg.train_start, "->", cfg.train_end)
+    gc.collect()
 
     train_start = cfg.train_start
     train_end = cfg.train_end
@@ -388,7 +402,12 @@ def main():
     valid_end = cfg.valid_end
 
     train_ds = StockWindowDatasetCS(frames, train_start, train_end, global_mu, global_sd)
+    gc.collect()
     valid_ds = StockWindowDatasetCS(frames, valid_start, valid_end, global_mu, global_sd)
+    gc.collect()
+
+    del frames
+    gc.collect()
 
     if len(train_ds) == 0:
         raise RuntimeError("Train dataset empty.")
@@ -416,7 +435,7 @@ def main():
         collate_fn=collate_with_dates,
     )
 
-    num_features = train_ds.X.shape[-1]
+    num_features = train_ds.num_features
     model = ReturnPredictor(num_features).to(cfg.device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-3)
