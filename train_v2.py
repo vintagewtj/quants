@@ -31,7 +31,8 @@ class CFG:
     lookback: int = 60
     horizon: int = 5
     batch_size: int = 256
-    lr: float = 3e-4
+    lr: float = 5e-5
+    weight_decay: float = 5e-3
     epochs: int = 30
     num_workers: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,6 +87,7 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     输出列：
       date(datetime64), feat_cols..., y_raw(未来N日收益)
     不做标准化；标准化在训练期统计量里做
+    容错：如果原始数据缺少 turnover/amount/outstanding_share，跳过对应特征
     """
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -94,30 +96,90 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["r1"] = df["close"].pct_change(1)
-    df["r5"] = df["close"].pct_change(5)
-    df["r10"] = df["close"].pct_change(10)
-
     def ma(x, w): return x.rolling(w).mean()
     def std(x, w): return x.rolling(w).std()
 
+    # --- 原有特征 ---
+    df["r1"] = df["close"].pct_change(1)
+    df["r5"] = df["close"].pct_change(5)
+    df["r10"] = df["close"].pct_change(10)
+    df["r20"] = df["close"].pct_change(20)
+    df["r60"] = df["close"].pct_change(60)
+
+    df["ma5"] = ma(df["close"], 5)
+    df["ma10"] = ma(df["close"], 10)
     df["ma20"] = ma(df["close"], 20)
     df["ma60"] = ma(df["close"], 60)
+    df["d_ma5"] = df["close"] / df["ma5"] - 1.0
+    df["d_ma10"] = df["close"] / df["ma10"] - 1.0
     df["d_ma20"] = df["close"] / df["ma20"] - 1.0
     df["d_ma60"] = df["close"] / df["ma60"] - 1.0
 
+    df["vol_ma5"] = ma(df["volume"], 5)
     df["vol_ma20"] = ma(df["volume"], 20)
     df["d_vol20"] = df["volume"] / df["vol_ma20"] - 1.0
+    df["vol_ratio"] = df["volume"] / df["vol_ma5"] - 1.0
 
     df["hl_range"] = (df["high"] - df["low"]) / df["close"]
     df["vol10"] = std(df["r1"], 10)
     df["vol20"] = std(df["r1"], 20)
     df["vol60"] = std(df["r1"], 60)
+    df["vol5"] = std(df["r1"], 5)
+
+    # --- K线形态特征 ---
+    hl = df["high"] - df["low"] + 1e-8
+    df["oc_range"] = (df["close"] - df["open"]) / df["close"]
+    df["upper_shadow"] = (df["high"] - df[["open", "close"]].max(axis=1)) / hl
+    df["lower_shadow"] = (df[["open", "close"]].min(axis=1) - df["low"]) / hl
+    df["close_pos"] = (df["close"] - df["low"]) / hl
+
+    # --- KDJ RSV ---
+    low9 = df["low"].rolling(9).min()
+    high9 = df["high"].rolling(9).max()
+    df["rsv"] = (df["close"] - low9) / (high9 - low9 + 1e-8)
+
+    # --- 资金流量代理 ---
+    df["mfi_proxy"] = df["r1"] * df["volume"]
+
+    # --- 换手率特征（容错） ---
+    if "turnover" in df.columns:
+        df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
+        df["turn"] = df["turnover"]
+        df["turn_ma5"] = ma(df["turnover"], 5)
+        df["turn_ma20"] = ma(df["turnover"], 20)
+        df["d_turn20"] = df["turnover"] / df["turn_ma20"] - 1.0
+
+    # --- 成交额特征（容错） ---
+    if "amount" in df.columns:
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        df["amt_ma5"] = ma(df["amount"], 5)
+        df["amt_ma20"] = ma(df["amount"], 20)
+        df["d_amt20"] = df["amount"] / df["amt_ma20"] - 1.0
+        df["amt_vol_ratio"] = df["amount"] / (df["volume"] + 1e-8)
+
+    # --- 对数市值代理（容错） ---
+    if "outstanding_share" in df.columns:
+        df["outstanding_share"] = pd.to_numeric(df["outstanding_share"], errors="coerce")
+        df["ln_mcap"] = np.log(df["close"] * df["outstanding_share"] + 1)
 
     # raw label
     df["y_raw"] = df["close"].shift(-cfg.horizon) / df["close"] - 1.0
 
-    feat_cols = ["r1", "r5", "r10", "d_ma20", "d_ma60", "d_vol20", "hl_range", "vol10", "vol20", "vol60"]
+    # 动态构建 feat_cols（只保留 DataFrame 中实际存在的列）
+    candidate_cols = [
+        "r1", "r5", "r10", "r20", "r60",
+        "d_ma5", "d_ma10", "d_ma20", "d_ma60",
+        "d_vol20", "vol_ratio",
+        "hl_range", "vol5", "vol10", "vol20", "vol60",
+        "oc_range", "upper_shadow", "lower_shadow", "close_pos",
+        "rsv", "mfi_proxy",
+        # 容错特征
+        "turn", "turn_ma5", "turn_ma20", "d_turn20",
+        "amt_ma5", "amt_ma20", "d_amt20", "amt_vol_ratio",
+        "ln_mcap",
+    ]
+    feat_cols = [c for c in candidate_cols if c in df.columns]
+
     df = df.dropna(subset=feat_cols + ["y_raw"]).reset_index(drop=True)
 
     return df[["date"] + feat_cols + ["y_raw"]]
@@ -257,14 +319,14 @@ class PositionalEncoding(nn.Module):
 
 
 class ReturnPredictor(nn.Module):
-    def __init__(self, num_features: int, d_model: int = 64, nhead: int = 4, num_layers: int = 2, dropout: float = 0.1):
+    def __init__(self, num_features: int, d_model: int = 32, nhead: int = 4, num_layers: int = 1, dropout: float = 0.3, dim_feedforward: int = 128):
         super().__init__()
         self.proj = nn.Linear(num_features, d_model)
         self.pos = PositionalEncoding(d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=256,
+            dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
             activation="gelu",
@@ -272,9 +334,11 @@ class ReturnPredictor(nn.Module):
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, 64),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 32),
             nn.GELU(),
-            nn.Linear(64, 1),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -419,12 +483,13 @@ def main():
     num_features = train_ds.X.shape[-1]
     model = ReturnPredictor(num_features).to(cfg.device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2, )
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # patience=3 < early_stop_patience=5，让 LR 先降一次再判断是否早停
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
 
     loss_fn = nn.HuberLoss(delta=0.02)  # delta 可调；0.02 对5日收益比较常用
 
-    best = 1e9
+    best_rankic = -1e9
     bad_epochs = 0
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
@@ -446,8 +511,8 @@ def main():
         train_loss = float(np.mean(losses)) if losses else 1e9
         val_metrics = evaluate(model, valid_loader, cfg.device)
 
-        # scheduler 根据 valid mse 调整学习率
-        scheduler.step(val_metrics["mse"])
+        # scheduler 根据 valid_rankic 调整学习率
+        scheduler.step(val_metrics["rankic"])
 
         lr_now = opt.param_groups[0]["lr"]
         print(
@@ -455,12 +520,12 @@ def main():
             f"train_huber={train_loss:.6f} "
             f"valid_mse={val_metrics['mse']:.6f} "
             f"valid_ic={val_metrics['ic']:.4f} "
-            f"valid_rankic={val_metrics['rankic']:.4f}"
+            f"★valid_rankic={val_metrics['rankic']:.4f}"
         )
 
-        # 早停依据：valid_mse
-        if val_metrics["mse"] + cfg.min_delta < best:
-            best = val_metrics["mse"]
+        # 早停依据：valid_rankic（越高越好）
+        if val_metrics["rankic"] > best_rankic + cfg.min_delta:
+            best_rankic = val_metrics["rankic"]
             bad_epochs = 0
             torch.save(
                 {
@@ -468,14 +533,15 @@ def main():
                     "cfg": cfg.__dict__,
                     "global_mu": global_mu.to_dict(),
                     "global_sd": global_sd.to_dict(),
+                    "feat_cols": feat_cols,
                 },
                 cfg.best_ckpt,
             )
-            print(f"saved {cfg.best_ckpt}")
+            print(f"★ 保存最佳 checkpoint (valid_rankic={best_rankic:.4f}): {cfg.best_ckpt}")
         else:
             bad_epochs += 1
             if bad_epochs >= cfg.early_stop_patience:
-                print(f"Early stopping triggered at epoch={epoch}. best_valid_mse={best:.6f}")
+                print(f"早停触发，epoch={epoch}，best valid_rankic={best_rankic:.4f}")
                 break
 
 
