@@ -1,0 +1,197 @@
+# predict_v1.py
+# 适配 v1 train.py（训练期全局统计量标准化，label=未来N日收益 y）
+# 用法：python predict_v1.py
+
+import os
+import glob
+import math
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+
+# =========================
+# Config
+# =========================
+LOOKBACK = 60
+TOPK = 10
+
+BASE_DIR = os.path.dirname(__file__)
+
+# ✅ 你的数据目录（按你当前 akshare 抓取脚本）
+RAW_DIR = os.path.join(BASE_DIR, "data_akshare", "raw")
+
+# ✅ v1 checkpoint
+CKPT = os.path.join(BASE_DIR, "checkpoints", "best.pt")
+
+OUT_DIR = os.path.join(BASE_DIR, "outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+FEAT_COLS = ["r1","r5","r10","d_ma20","d_ma60","d_vol20","hl_range","vol10","vol20","vol60"]
+
+
+# =========================
+# Model (must match train.py)
+# =========================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, : x.size(1)]
+
+
+class ReturnPredictor(nn.Module):
+    def __init__(self, num_features, d_model=64, nhead=4, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.proj = nn.Linear(num_features, d_model)
+        self.pos = PositionalEncoding(d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=256,
+            dropout=dropout, batch_first=True, activation="gelu"
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        h = self.proj(x)
+        h = self.pos(h)
+        h = self.enc(h)
+        return self.head(h[:, -1, :])
+
+
+# =========================
+# Feature engineering (match v1 train.py: NO per-stock zscore)
+# =========================
+def make_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["r1"]  = df["close"].pct_change(1)
+    df["r5"]  = df["close"].pct_change(5)
+    df["r10"] = df["close"].pct_change(10)
+
+    def ma(x, w): return x.rolling(w).mean()
+    def std(x, w): return x.rolling(w).std()
+
+    df["ma20"] = ma(df["close"], 20)
+    df["ma60"] = ma(df["close"], 60)
+    df["d_ma20"] = df["close"] / df["ma20"] - 1.0
+    df["d_ma60"] = df["close"] / df["ma60"] - 1.0
+
+    df["vol_ma20"] = ma(df["volume"], 20)
+    df["d_vol20"] = df["volume"] / df["vol_ma20"] - 1.0
+
+    df["hl_range"] = (df["high"] - df["low"]) / df["close"]
+    df["vol10"] = std(df["r1"], 10)
+    df["vol20"] = std(df["r1"], 20)
+    df["vol60"] = std(df["r1"], 60)
+
+    df = df.dropna(subset=FEAT_COLS).reset_index(drop=True)
+    return df[["date"] + FEAT_COLS]
+
+
+def load_global_stats(state: dict) -> tuple[pd.Series, pd.Series]:
+    if "global_mu" not in state or "global_sd" not in state:
+        raise RuntimeError("checkpoint missing global_mu/global_sd (v1 train.py should have saved them)")
+    mu = pd.Series(state["global_mu"]).reindex(FEAT_COLS)
+    sd = pd.Series(state["global_sd"]).reindex(FEAT_COLS)
+    sd = sd.replace(0, 1e-8).fillna(1e-8)
+    if mu.isna().any():
+        raise RuntimeError(f"global_mu missing cols: {mu[mu.isna()].index.tolist()}")
+    return mu, sd
+
+
+@torch.no_grad()
+def predict_one(model: nn.Module, df_feat: pd.DataFrame, mu: pd.Series, sd: pd.Series) -> float | None:
+    if len(df_feat) < LOOKBACK:
+        return None
+
+    x = df_feat[FEAT_COLS].copy()
+    x = (x - mu) / sd
+    x = x.values.astype(np.float32)[-LOOKBACK:]          # [L, F]
+    xt = torch.tensor(x).unsqueeze(0).to(DEVICE)         # [1, L, F]
+    return float(model(xt).item())
+
+
+def main():
+    if not os.path.exists(CKPT):
+        raise FileNotFoundError(f"checkpoint not found: {CKPT}")
+
+    # 读 ckpt
+    state = torch.load(CKPT, map_location="cpu")
+    mu, sd = load_global_stats(state)
+
+    # 找数据
+    files = sorted(glob.glob(os.path.join(RAW_DIR, "*.parquet")))
+    if not files:
+        files = sorted(glob.glob(os.path.join(RAW_DIR, "*.csv")))
+    if not files:
+        raise RuntimeError(f"No parquet/csv files in {RAW_DIR}")
+
+    # load model
+    num_features = len(FEAT_COLS)
+    model = ReturnPredictor(num_features).to(DEVICE)
+    model.load_state_dict(state["model"])
+    model.eval()
+
+    rows = []
+    for fp in files:
+        code = os.path.splitext(os.path.basename(fp))[0]
+        try:
+            df = pd.read_parquet(fp) if fp.endswith(".parquet") else pd.read_csv(fp)
+            if "date" not in df.columns:
+                continue
+            df_feat = make_features(df)
+            pred = predict_one(model, df_feat, mu, sd)
+            if pred is None:
+                continue
+            last_date = pd.to_datetime(df_feat["date"].iloc[-1]).date()
+            rows.append({
+                "stock_code": code,
+                "asof_date": str(last_date),
+                "pred_return_Nd": pred,
+                "pred_return_pct": pred * 100.0,
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        raise RuntimeError("No predictions generated.")
+
+    out = pd.DataFrame(rows).sort_values("pred_return_Nd", ascending=False).reset_index(drop=True)
+    top = out.head(TOPK).copy()
+
+    today = pd.Timestamp.now().strftime("%Y%m%d")
+    out_path_all = os.path.join(OUT_DIR, f"pred_all_{today}.csv")
+    out_path_top = os.path.join(OUT_DIR, f"recommend_top{TOPK}_{today}.csv")
+
+    out.to_csv(out_path_all, index=False, encoding="utf-8-sig")
+    top.to_csv(out_path_top, index=False, encoding="utf-8-sig")
+
+    print("Saved:")
+    print("  ", out_path_all)
+    print("  ", out_path_top)
+    print("\nTopK:")
+    print(top[["stock_code","asof_date","pred_return_pct"]])
+
+
+if __name__ == "__main__":
+    main()
